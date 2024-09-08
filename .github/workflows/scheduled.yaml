@@ -35,7 +35,7 @@ jobs:
 
   cache-cleanup:
     name: Cache Cleanup 🧹
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     permissions:
       actions: write
     steps:
@@ -88,10 +88,18 @@ jobs:
     needs: cache-cleanup
     secrets: inherit
 
+  analyze-project:
+    name: Analyze 🔬
+    uses: ./.github/workflows/analyze-project.yaml
+    needs: cache-cleanup
+    secrets: inherit
+    permissions:
+      security-events: write
+
   upload-language-files:
     name: Upload Language Files 🌐
     if: github.repository_owner == 'obsproject' && github.ref_name == 'master'
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:

@@ -1,6 +1,6 @@
-#include "lineedit-autoresize.hpp"
+#include "moc_lineedit-autoresize.cpp"
 
-LineEditAutoResize::LineEditAutoResize()
+LineEditAutoResize::LineEditAutoResize() : m_maxLength(32767)
 {
 	connect(this, &LineEditAutoResize::textChanged, this,
 		&LineEditAutoResize::checkTextLength);

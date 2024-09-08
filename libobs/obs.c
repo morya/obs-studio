@@ -878,13 +878,13 @@ static void obs_free_video(void)
 		obs_free_video_mix(video);
 		obs->video.mixes.array[i] = NULL;
 	}
+	da_free(obs->video.mixes);
 	if (num_views > 0)
 		blog(LOG_WARNING, "Number of remaining views: %ld", num_views);
 	pthread_mutex_unlock(&obs->video.mixes_mutex);
 
 	pthread_mutex_destroy(&obs->video.mixes_mutex);
 	pthread_mutex_init_value(&obs->video.mixes_mutex);
-	da_free(obs->video.mixes);
 
 	for (size_t i = 0; i < obs->video.ready_encoder_groups.num; i++) {
 		obs_weak_encoder_release(
@@ -1117,6 +1117,8 @@ static const char *obs_signals[] = {
 	"void source_hide(ptr source)",
 	"void source_audio_activate(ptr source)",
 	"void source_audio_deactivate(ptr source)",
+	"void source_filter_add(ptr source, ptr filter)",
+	"void source_filter_remove(ptr source, ptr filter)",
 	"void source_rename(ptr source, string new_name, string prev_name)",
 	"void source_volume(ptr source, in out float volume)",
 	"void source_volume_level(ptr source, float level, float magnitude, "
@@ -1589,6 +1591,8 @@ int obs_reset_video(struct obs_video_info *ovi)
 	     get_video_format_name(ovi->output_format),
 	     yuv ? yuv_format : "None", yuv ? "/" : "", yuv ? yuv_range : "");
 
+	source_profiler_reset_video(ovi);
+
 	return obs_init_video(ovi);
 }
 
@@ -2041,11 +2045,6 @@ static inline void *obs_service_addref_safe_(void *ref)
 	return obs_service_get_ref(ref);
 }
 
-static inline void *obs_id_(void *data)
-{
-	return data;
-}
-
 obs_source_t *obs_get_source_by_name(const char *name)
 {
 	return get_context_by_name(&obs->data.public_sources, name,
@@ -2144,12 +2143,6 @@ gs_effect_t *obs_get_base_effect(enum obs_base_effect effect)
 	return NULL;
 }
 
-/* OBS_DEPRECATED */
-gs_effect_t *obs_get_default_rect_effect(void)
-{
-	return obs->video.default_rect_effect;
-}
-
 signal_handler_t *obs_get_signal_handler(void)
 {
 	return obs->signals;
@@ -2158,12 +2151,6 @@ signal_handler_t *obs_get_signal_handler(void)
 proc_handler_t *obs_get_proc_handler(void)
 {
 	return obs->procs;
-}
-
-/* OBS_DEPRECATED */
-void obs_render_main_view(void)
-{
-	obs_view_render(&obs->data.main_view);
 }
 
 static void obs_render_main_texture_internal(enum gs_blend_type src_c,
@@ -2240,16 +2227,6 @@ gs_texture_t *obs_get_main_texture(void)
 		return NULL;
 
 	return video->render_texture;
-}
-
-void obs_set_master_volume(float volume)
-{
-	UNUSED_PARAMETER(volume);
-}
-
-float obs_get_master_volume(void)
-{
-	return 1.f;
 }
 
 static obs_source_t *obs_load_source_type(obs_data_t *source_data,

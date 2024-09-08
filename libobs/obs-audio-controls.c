@@ -36,8 +36,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #define CLAMP(x, min, max) ((x) < min ? min : ((x) > max ? max : (x)))
 
-typedef float (*obs_fader_conversion_t)(const float val);
-
 struct fader_cb {
 	obs_fader_changed_t callback;
 	void *param;
@@ -863,29 +861,6 @@ void obs_volmeter_set_peak_meter_type(obs_volmeter_t *volmeter,
 	pthread_mutex_unlock(&volmeter->mutex);
 }
 
-void obs_volmeter_set_update_interval(obs_volmeter_t *volmeter,
-				      const unsigned int ms)
-{
-	if (!volmeter || !ms)
-		return;
-
-	pthread_mutex_lock(&volmeter->mutex);
-	volmeter->update_ms = ms;
-	pthread_mutex_unlock(&volmeter->mutex);
-}
-
-unsigned int obs_volmeter_get_update_interval(obs_volmeter_t *volmeter)
-{
-	if (!volmeter)
-		return 0;
-
-	pthread_mutex_lock(&volmeter->mutex);
-	const unsigned int interval = volmeter->update_ms;
-	pthread_mutex_unlock(&volmeter->mutex);
-
-	return interval;
-}
-
 int obs_volmeter_get_nr_channels(obs_volmeter_t *volmeter)
 {
 	int source_nr_audio_channels;
@@ -942,4 +917,9 @@ float obs_mul_to_db(float mul)
 float obs_db_to_mul(float db)
 {
 	return db_to_mul(db);
+}
+
+obs_fader_conversion_t obs_fader_db_to_def(obs_fader_t *fader)
+{
+	return fader->db_to_def;
 }

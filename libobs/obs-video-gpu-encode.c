@@ -40,6 +40,7 @@ static void *gpu_encode_thread(void *data)
 		uint64_t lock_key;
 		uint64_t next_key;
 		size_t lock_count = 0;
+		uint64_t fer_ts = 0;
 
 		if (os_atomic_load_bool(&video->gpu_encode_stop))
 			break;
@@ -82,7 +83,7 @@ static void *gpu_encode_thread(void *data)
 			uint32_t skip = 0;
 
 			obs_encoder_t *encoder = encoders.array[i];
-			struct obs_encoder **paired =
+			obs_weak_encoder_t **paired =
 				encoder->paired_encoders.array;
 			size_t num_paired = encoder->paired_encoders.num;
 
@@ -92,7 +93,7 @@ static void *gpu_encode_thread(void *data)
 			pkt.encoder = encoder;
 
 			if (encoder->encoder_group && !encoder->start_ts) {
-				struct encoder_group *group =
+				struct obs_encoder_group *group =
 					encoder->encoder_group;
 				bool ready = false;
 				pthread_mutex_lock(&group->mutex);
@@ -105,13 +106,21 @@ static void *gpu_encode_thread(void *data)
 			if (!encoder->first_received && num_paired) {
 				bool wait_for_audio = false;
 
-				for (size_t idx = 0; idx < num_paired; idx++) {
-					if (!paired[idx]->first_received ||
-					    paired[idx]->first_raw_ts >
-						    timestamp) {
+				for (size_t idx = 0;
+				     !wait_for_audio && idx < num_paired;
+				     idx++) {
+					obs_encoder_t *enc =
+						obs_weak_encoder_get_encoder(
+							paired[idx]);
+					if (!enc)
+						continue;
+
+					if (!enc->first_received ||
+					    enc->first_raw_ts > timestamp) {
 						wait_for_audio = true;
-						break;
 					}
+
+					obs_encoder_release(enc);
 				}
 
 				if (wait_for_audio)
@@ -145,6 +154,11 @@ static void *gpu_encode_thread(void *data)
 			else
 				next_key++;
 
+			/* Get the frame encode request timestamp. This
+			 * needs to be read just before the encode request.
+			 */
+			fer_ts = os_gettime_ns();
+
 			profile_start(gpu_encode_frame_name);
 			if (encoder->info.encode_texture2) {
 				struct encoder_texture tex = {0};
@@ -164,6 +178,27 @@ static void *gpu_encode_thread(void *data)
 					&pkt, &received);
 			}
 			profile_end(gpu_encode_frame_name);
+
+			/* Generate and enqueue the frame timing metrics, namely
+			 * the CTS (composition time), FER (frame encode request), FERC
+			 * (frame encode request complete) and current PTS. PTS is used to
+			 * associate the frame timing data with the encode packet. */
+			if (tf.timestamp) {
+				struct encoder_packet_time *ept =
+					da_push_back_new(
+						encoder->encoder_packet_times);
+				// Get the frame encode request complete timestamp
+				if (success) {
+					ept->ferc = os_gettime_ns();
+				} else {
+					// Encode had error, set ferc to 0
+					ept->ferc = 0;
+				}
+
+				ept->pts = encoder->cur_pts;
+				ept->cts = tf.timestamp;
+				ept->fer = fer_ts;
+			}
 
 			send_off_encoder_packet(encoder, success, received,
 						&pkt);

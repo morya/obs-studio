@@ -122,6 +122,13 @@ create_encoder(const char *id, enum obs_encoder_type type, const char *name,
 	}
 
 	blog(LOG_DEBUG, "encoder '%s' (%s) created", name, id);
+
+	if (ei && ei->caps & OBS_ENCODER_CAP_DEPRECATED) {
+		blog(LOG_WARNING,
+		     "Encoder ID '%s' is deprecated and may be removed in a future version.",
+		     id);
+	}
+
 	return encoder;
 }
 
@@ -180,8 +187,15 @@ static inline void get_video_info(struct obs_encoder *encoder,
 	if (encoder->info.get_video_info)
 		encoder->info.get_video_info(encoder->context.data, info);
 
-	if (info->width != voi->width || info->height != voi->height)
-		obs_encoder_set_scaled_size(encoder, info->width, info->height);
+	/**
+	 * Prevent video output from performing an actual scale. If GPU scaling is
+	 * enabled, the voi will contain the scaled size. Therefore, GPU scaling
+	 * takes priority over self-scaling functionality.
+	 */
+	if ((encoder->info.caps & OBS_ENCODER_CAP_SCALING) != 0) {
+		info->width = voi->width;
+		info->height = voi->height;
+	}
 }
 
 static inline bool gpu_encode_available(const struct obs_encoder *encoder)
@@ -325,11 +339,10 @@ static void add_connection(struct obs_encoder *encoder)
 	}
 
 	if (encoder->encoder_group) {
-		bool ready = false;
 		pthread_mutex_lock(&encoder->encoder_group->mutex);
-		encoder->encoder_group->encoders_started += 1;
-		ready = encoder->encoder_group->encoders_started ==
-			encoder->encoder_group->encoders_added;
+		encoder->encoder_group->num_encoders_started += 1;
+		bool ready = encoder->encoder_group->num_encoders_started >=
+			     encoder->encoder_group->encoders.num;
 		pthread_mutex_unlock(&encoder->encoder_group->mutex);
 		if (ready)
 			add_ready_encoder_group(encoder);
@@ -338,6 +351,7 @@ static void add_connection(struct obs_encoder *encoder)
 	set_encoder_active(encoder, true);
 }
 
+void obs_encoder_group_actually_destroy(obs_encoder_group_t *group);
 static void remove_connection(struct obs_encoder *encoder, bool shutdown)
 {
 	if (encoder->info.type == OBS_ENCODER_AUDIO) {
@@ -353,10 +367,8 @@ static void remove_connection(struct obs_encoder *encoder, bool shutdown)
 
 	if (encoder->encoder_group) {
 		pthread_mutex_lock(&encoder->encoder_group->mutex);
-		encoder->encoder_group->encoders_started -= 1;
-		if (encoder->encoder_group->encoders_started == 0)
+		if (--encoder->encoder_group->num_encoders_started == 0)
 			encoder->encoder_group->start_timestamp = 0;
-
 		pthread_mutex_unlock(&encoder->encoder_group->mutex);
 	}
 
@@ -367,6 +379,8 @@ static void remove_connection(struct obs_encoder *encoder, bool shutdown)
 	 * up again */
 	if (shutdown)
 		obs_encoder_shutdown(encoder);
+	encoder->initialized = false;
+
 	set_encoder_active(encoder, false);
 }
 
@@ -379,7 +393,7 @@ static inline void free_audio_buffers(struct obs_encoder *encoder)
 	}
 }
 
-static void obs_encoder_actually_destroy(obs_encoder_t *encoder)
+void obs_encoder_destroy(obs_encoder_t *encoder)
 {
 	if (encoder) {
 		pthread_mutex_lock(&encoder->outputs_mutex);
@@ -395,22 +409,7 @@ static void obs_encoder_actually_destroy(obs_encoder_t *encoder)
 		blog(LOG_DEBUG, "encoder '%s' destroyed",
 		     encoder->context.name);
 
-		if (encoder->encoder_group) {
-			struct encoder_group *group = encoder->encoder_group;
-			bool release = false;
-
-			encoder->encoder_group = NULL;
-
-			pthread_mutex_lock(&group->mutex);
-			group->encoders_added -= 1;
-			release = group->encoders_added == 0;
-			pthread_mutex_unlock(&group->mutex);
-
-			if (release) {
-				pthread_mutex_destroy(&group->mutex);
-				bfree(group);
-			}
-		}
+		obs_encoder_set_group(encoder, NULL);
 
 		free_audio_buffers(encoder);
 
@@ -418,6 +417,7 @@ static void obs_encoder_actually_destroy(obs_encoder_t *encoder)
 			encoder->info.destroy(encoder->context.data);
 		da_free(encoder->callbacks);
 		da_free(encoder->roi);
+		da_free(encoder->encoder_packet_times);
 		pthread_mutex_destroy(&encoder->init_mutex);
 		pthread_mutex_destroy(&encoder->callbacks_mutex);
 		pthread_mutex_destroy(&encoder->outputs_mutex);
@@ -432,28 +432,6 @@ static void obs_encoder_actually_destroy(obs_encoder_t *encoder)
 			video_output_free_frame_rate_divisor(
 				encoder->fps_override);
 		bfree(encoder);
-	}
-}
-
-/* does not actually destroy the encoder until all connections to it have been
- * removed. (full reference counting really would have been superfluous) */
-void obs_encoder_destroy(obs_encoder_t *encoder)
-{
-	if (encoder) {
-		bool destroy;
-
-		obs_context_data_remove(&encoder->context);
-
-		pthread_mutex_lock(&encoder->init_mutex);
-		pthread_mutex_lock(&encoder->callbacks_mutex);
-		destroy = encoder->callbacks.num == 0;
-		if (!destroy)
-			encoder->destroy_on_stop = true;
-		pthread_mutex_unlock(&encoder->callbacks_mutex);
-		pthread_mutex_unlock(&encoder->init_mutex);
-
-		if (destroy)
-			obs_encoder_actually_destroy(encoder);
 	}
 }
 
@@ -720,21 +698,25 @@ void obs_encoder_shutdown(obs_encoder_t *encoder)
 	if (encoder->context.data) {
 		encoder->info.destroy(encoder->context.data);
 		encoder->context.data = NULL;
-		da_free(encoder->paired_encoders);
 		encoder->first_received = false;
 		encoder->offset_usec = 0;
 		encoder->start_ts = 0;
 		encoder->frame_rate_divisor_counter = 0;
 		maybe_clear_encoder_core_video_mix(encoder);
+
+		for (size_t i = 0; i < encoder->paired_encoders.num; i++) {
+			obs_weak_encoder_release(
+				encoder->paired_encoders.array[i]);
+		}
+		da_free(encoder->paired_encoders);
 	}
 	obs_encoder_set_last_error(encoder, NULL);
 	pthread_mutex_unlock(&encoder->init_mutex);
 }
 
-static inline size_t
-get_callback_idx(const struct obs_encoder *encoder,
-		 void (*new_packet)(void *param, struct encoder_packet *packet),
-		 void *param)
+static inline size_t get_callback_idx(const struct obs_encoder *encoder,
+				      encoded_callback_t new_packet,
+				      void *param)
 {
 	for (size_t i = 0; i < encoder->callbacks.num; i++) {
 		struct encoder_callback *cb = encoder->callbacks.array + i;
@@ -756,10 +738,9 @@ void pause_reset(struct pause_data *pause)
 	pthread_mutex_unlock(&pause->mutex);
 }
 
-static inline void obs_encoder_start_internal(
-	obs_encoder_t *encoder,
-	void (*new_packet)(void *param, struct encoder_packet *packet),
-	void *param)
+static inline void obs_encoder_start_internal(obs_encoder_t *encoder,
+					      encoded_callback_t new_packet,
+					      void *param)
 {
 	struct encoder_callback cb = {false, new_packet, param};
 	bool first = false;
@@ -786,9 +767,7 @@ static inline void obs_encoder_start_internal(
 	}
 }
 
-void obs_encoder_start(obs_encoder_t *encoder,
-		       void (*new_packet)(void *param,
-					  struct encoder_packet *packet),
+void obs_encoder_start(obs_encoder_t *encoder, encoded_callback_t new_packet,
 		       void *param)
 {
 	if (!obs_encoder_valid(encoder, "obs_encoder_start"))
@@ -801,14 +780,18 @@ void obs_encoder_start(obs_encoder_t *encoder,
 	pthread_mutex_unlock(&encoder->init_mutex);
 }
 
-static inline bool obs_encoder_stop_internal(
-	obs_encoder_t *encoder,
-	void (*new_packet)(void *param, struct encoder_packet *packet),
-	void *param)
+void obs_encoder_stop(obs_encoder_t *encoder, encoded_callback_t new_packet,
+		      void *param)
 {
 	bool last = false;
 	size_t idx;
 
+	if (!obs_encoder_valid(encoder, "obs_encoder_stop"))
+		return;
+	if (!obs_ptr_valid(new_packet, "obs_encoder_stop"))
+		return;
+
+	pthread_mutex_lock(&encoder->init_mutex);
 	pthread_mutex_lock(&encoder->callbacks_mutex);
 
 	idx = get_callback_idx(encoder, new_packet, param);
@@ -819,36 +802,33 @@ static inline bool obs_encoder_stop_internal(
 
 	pthread_mutex_unlock(&encoder->callbacks_mutex);
 
+	encoder->encoder_packet_times.num = 0;
+
 	if (last) {
 		remove_connection(encoder, true);
-		encoder->initialized = false;
+		pthread_mutex_unlock(&encoder->init_mutex);
 
-		if (encoder->destroy_on_stop) {
-			pthread_mutex_unlock(&encoder->init_mutex);
-			obs_encoder_actually_destroy(encoder);
-			return true;
+		struct obs_encoder_group *group = encoder->encoder_group;
+
+		/* Destroying the group all the way back here prevents a race
+		 * where destruction of the group can prematurely destroy the
+		 * encoder within internal functions. This is the point where it
+		 * is safe to destroy the group, even if the encoder is then
+		 * also destroyed. */
+		if (group) {
+			pthread_mutex_lock(&group->mutex);
+			if (group->destroy_on_stop &&
+			    group->num_encoders_started == 0)
+				obs_encoder_group_actually_destroy(group);
+			else
+				pthread_mutex_unlock(&group->mutex);
 		}
+
+		/* init_mutex already unlocked */
+		return;
 	}
 
-	return false;
-}
-
-void obs_encoder_stop(obs_encoder_t *encoder,
-		      void (*new_packet)(void *param,
-					 struct encoder_packet *packet),
-		      void *param)
-{
-	bool destroyed;
-
-	if (!obs_encoder_valid(encoder, "obs_encoder_stop"))
-		return;
-	if (!obs_ptr_valid(new_packet, "obs_encoder_stop"))
-		return;
-
-	pthread_mutex_lock(&encoder->init_mutex);
-	destroyed = obs_encoder_stop_internal(encoder, new_packet, param);
-	if (!destroyed)
-		pthread_mutex_unlock(&encoder->init_mutex);
+	pthread_mutex_unlock(&encoder->init_mutex);
 }
 
 const char *obs_encoder_get_codec(const obs_encoder_t *encoder)
@@ -875,6 +855,13 @@ enum obs_encoder_type obs_get_encoder_type(const char *id)
 {
 	struct obs_encoder_info *info = find_encoder(id);
 	return info ? info->type : OBS_ENCODER_AUDIO;
+}
+
+uint32_t obs_encoder_get_encoded_frames(const obs_encoder_t *encoder)
+{
+	return obs_encoder_valid(encoder, "obs_output_get_encoded_frames")
+		       ? encoder->encoded_frames
+		       : 0;
 }
 
 void obs_encoder_set_scaled_size(obs_encoder_t *encoder, uint32_t width,
@@ -1280,7 +1267,8 @@ static inline bool get_sei(const struct obs_encoder *encoder, uint8_t **sei,
 
 static void send_first_video_packet(struct obs_encoder *encoder,
 				    struct encoder_callback *cb,
-				    struct encoder_packet *packet)
+				    struct encoder_packet *packet,
+				    struct encoder_packet_time *packet_time)
 {
 	struct encoder_packet first_packet;
 	DARRAY(uint8_t) data;
@@ -1294,7 +1282,7 @@ static void send_first_video_packet(struct obs_encoder *encoder,
 	da_init(data);
 
 	if (!get_sei(encoder, &sei, &size) || !sei || !size) {
-		cb->new_packet(cb->param, packet);
+		cb->new_packet(cb->param, packet, packet_time);
 		cb->sent_first_packet = true;
 		return;
 	}
@@ -1306,7 +1294,7 @@ static void send_first_video_packet(struct obs_encoder *encoder,
 	first_packet.data = data.array;
 	first_packet.size = data.num;
 
-	cb->new_packet(cb->param, &first_packet);
+	cb->new_packet(cb->param, &first_packet, packet_time);
 	cb->sent_first_packet = true;
 
 	da_free(data);
@@ -1315,14 +1303,15 @@ static void send_first_video_packet(struct obs_encoder *encoder,
 static const char *send_packet_name = "send_packet";
 static inline void send_packet(struct obs_encoder *encoder,
 			       struct encoder_callback *cb,
-			       struct encoder_packet *packet)
+			       struct encoder_packet *packet,
+			       struct encoder_packet_time *packet_time)
 {
 	profile_start(send_packet_name);
 	/* include SEI in first video packet */
 	if (encoder->info.type == OBS_ENCODER_VIDEO && !cb->sent_first_packet)
-		send_first_video_packet(encoder, cb, packet);
+		send_first_video_packet(encoder, cb, packet, packet_time);
 	else
-		cb->new_packet(cb->param, packet);
+		cb->new_packet(cb->param, packet, packet_time);
 	profile_end(send_packet_name);
 }
 
@@ -1345,7 +1334,6 @@ void full_stop(struct obs_encoder *encoder)
 		pthread_mutex_unlock(&encoder->callbacks_mutex);
 
 		remove_connection(encoder, false);
-		encoder->initialized = false;
 	}
 }
 
@@ -1375,20 +1363,53 @@ void send_off_encoder_packet(obs_encoder_t *encoder, bool success,
 		pkt->sys_dts_usec += encoder->pause.ts_offset / 1000;
 		pthread_mutex_unlock(&encoder->pause.mutex);
 
+		/* Find the encoder packet timing entry in the encoder
+		 * timing array with the corresponding PTS value, then remove
+		 * the entry from the array to ensure it doesn't continuously fill.
+		 */
+		struct encoder_packet_time ept_local;
+		struct encoder_packet_time *ept = NULL;
+		bool found_ept = false;
+		if (pkt->type == OBS_ENCODER_VIDEO) {
+			for (size_t i = encoder->encoder_packet_times.num;
+			     i > 0; i--) {
+				ept = &encoder->encoder_packet_times
+					       .array[i - 1];
+				if (ept->pts == pkt->pts) {
+					ept_local = *ept;
+					da_erase(encoder->encoder_packet_times,
+						 i - 1);
+					found_ept = true;
+					break;
+				}
+			}
+			if (!found_ept)
+				blog(LOG_DEBUG,
+				     "%s: Encoder packet timing for PTS %" PRId64
+				     " not found",
+				     __FUNCTION__, pkt->pts);
+		}
+
 		pthread_mutex_lock(&encoder->callbacks_mutex);
 
 		for (size_t i = encoder->callbacks.num; i > 0; i--) {
 			struct encoder_callback *cb;
 			cb = encoder->callbacks.array + (i - 1);
-			send_packet(encoder, cb, pkt);
+			send_packet(encoder, cb, pkt,
+				    found_ept ? &ept_local : NULL);
 		}
 
 		pthread_mutex_unlock(&encoder->callbacks_mutex);
+
+		// Count number of video frames successfully encoded
+		if (pkt->type == OBS_ENCODER_VIDEO)
+			encoder->encoded_frames++;
 	}
 }
 
 static const char *do_encode_name = "do_encode";
-bool do_encode(struct obs_encoder *encoder, struct encoder_frame *frame)
+bool do_encode(struct obs_encoder *encoder, struct encoder_frame *frame,
+	       const uint64_t *frame_cts)
 {
 	profile_start(do_encode_name);
 	if (!encoder->profile_encoder_encode_name)
@@ -1399,6 +1420,7 @@ bool do_encode(struct obs_encoder *encoder, struct encoder_frame *frame)
 	struct encoder_packet pkt = {0};
 	bool received = false;
 	bool success;
+	uint64_t fer_ts = 0;
 
 	if (encoder->reconfigure_requested) {
 		encoder->reconfigure_requested = false;
@@ -1410,10 +1432,34 @@ bool do_encode(struct obs_encoder *encoder, struct encoder_frame *frame)
 	pkt.timebase_den = encoder->timebase_den;
 	pkt.encoder = encoder;
 
+	/* Get the frame encode request timestamp. This
+	 * needs to be read just before the encode request.
+	 */
+	fer_ts = os_gettime_ns();
+
 	profile_start(encoder->profile_encoder_encode_name);
 	success = encoder->info.encode(encoder->context.data, frame, &pkt,
 				       &received);
 	profile_end(encoder->profile_encoder_encode_name);
+
+	/* Generate and enqueue the frame timing metrics, namely
+	 * the CTS (composition time), FER (frame encode request), FERC
+	 * (frame encode request complete) and current PTS. PTS is used to
+	 * associate the frame timing data with the encode packet. */
+	if (frame_cts) {
+		struct encoder_packet_time *ept =
+			da_push_back_new(encoder->encoder_packet_times);
+		// Get the frame encode request complete timestamp
+		if (success) {
+			ept->ferc = os_gettime_ns();
+		} else {
+			// Encode had error, set ferc to 0
+			ept->ferc = 0;
+		}
+		ept->pts = frame->pts;
+		ept->cts = *frame_cts;
+		ept->fer = fer_ts;
+	}
 	send_off_encoder_packet(encoder, success, received, &pkt);
 
 	profile_end(do_encode_name);
@@ -1457,11 +1503,10 @@ static void receive_video(void *param, struct video_data *frame)
 	profile_start(receive_video_name);
 
 	struct obs_encoder *encoder = param;
-	struct obs_encoder **paired = encoder->paired_encoders.array;
 	struct encoder_frame enc_frame;
 
 	if (encoder->encoder_group && !encoder->start_ts) {
-		struct encoder_group *group = encoder->encoder_group;
+		struct obs_encoder_group *group = encoder->encoder_group;
 		bool ready = false;
 		pthread_mutex_lock(&group->mutex);
 		ready = group->start_timestamp == frame->timestamp;
@@ -1472,10 +1517,18 @@ static void receive_video(void *param, struct video_data *frame)
 
 	if (!encoder->first_received && encoder->paired_encoders.num) {
 		for (size_t i = 0; i < encoder->paired_encoders.num; i++) {
-			if (!paired[i]->first_received ||
-			    paired[i]->first_raw_ts > frame->timestamp) {
+			obs_encoder_t *paired = obs_weak_encoder_get_encoder(
+				encoder->paired_encoders.array[i]);
+			if (!paired)
+				continue;
+
+			if (!paired->first_received ||
+			    paired->first_raw_ts > frame->timestamp) {
+				obs_encoder_release(paired);
 				goto wait_for_audio;
 			}
+
+			obs_encoder_release(paired);
 		}
 	}
 
@@ -1495,7 +1548,7 @@ static void receive_video(void *param, struct video_data *frame)
 	enc_frame.frames = 1;
 	enc_frame.pts = encoder->cur_pts;
 
-	if (do_encode(encoder, &enc_frame))
+	if (do_encode(encoder, &enc_frame, &frame->timestamp))
 		encoder->cur_pts +=
 			encoder->timebase_num * encoder->frame_rate_divisor;
 
@@ -1565,8 +1618,10 @@ static bool buffer_audio(struct obs_encoder *encoder, struct audio_data *data)
 
 	struct obs_encoder *paired_encoder = NULL;
 	/* Audio encoders can only be paired to one video encoder */
-	if (encoder->paired_encoders.num)
-		paired_encoder = encoder->paired_encoders.array[0];
+	if (encoder->paired_encoders.num) {
+		paired_encoder = obs_weak_encoder_get_encoder(
+			encoder->paired_encoders.array[0]);
+	}
 
 	if (!encoder->start_ts && paired_encoder) {
 		uint64_t end_ts = data->timestamp;
@@ -1607,6 +1662,7 @@ static bool buffer_audio(struct obs_encoder *encoder, struct audio_data *data)
 
 fail:
 	push_back_audio(encoder, data, size, offset_size);
+	obs_encoder_release(paired_encoder);
 
 	profile_end(buffer_audio_name);
 	return success;
@@ -1630,7 +1686,7 @@ static bool send_audio_data(struct obs_encoder *encoder)
 	enc_frame.frames = (uint32_t)encoder->framesize;
 	enc_frame.pts = encoder->cur_pts;
 
-	if (!do_encode(encoder, &enc_frame))
+	if (!do_encode(encoder, &enc_frame, NULL))
 		return false;
 
 	encoder->cur_pts += encoder->framesize;
@@ -1776,19 +1832,6 @@ void obs_encoder_packet_create_instance(struct encoder_packet *dst,
 	memcpy(dst->data, src->data, src->size);
 }
 
-/* OBS_DEPRECATED */
-void obs_duplicate_encoder_packet(struct encoder_packet *dst,
-				  const struct encoder_packet *src)
-{
-	obs_encoder_packet_create_instance(dst, src);
-}
-
-/* OBS_DEPRECATED */
-void obs_free_encoder_packet(struct encoder_packet *packet)
-{
-	obs_encoder_packet_release(packet);
-}
-
 void obs_encoder_packet_ref(struct encoder_packet *dst,
 			    struct encoder_packet *src)
 {
@@ -1833,14 +1876,6 @@ obs_encoder_get_preferred_video_format(const obs_encoder_t *encoder)
 		return VIDEO_FORMAT_NONE;
 
 	return encoder->preferred_format;
-}
-
-void obs_encoder_addref(obs_encoder_t *encoder)
-{
-	if (!encoder)
-		return;
-
-	obs_ref_addref(&encoder->context.control->ref);
 }
 
 void obs_encoder_release(obs_encoder_t *encoder)
@@ -2058,132 +2093,99 @@ uint32_t obs_encoder_get_roi_increment(const obs_encoder_t *encoder)
 	return encoder->roi_increment;
 }
 
-bool obs_encoder_group_keyframe_aligned_encoders(
-	obs_encoder_t *encoder, obs_encoder_t *encoder_to_be_grouped)
+bool obs_encoder_set_group(obs_encoder_t *encoder, obs_encoder_group_t *group)
 {
-	if (!obs_encoder_valid(encoder,
-			       "obs_encoder_group_keyframe_aligned_encoders") ||
-	    !obs_encoder_valid(encoder_to_be_grouped,
-			       "obs_encoder_group_keyframe_aligned_encoders"))
+	if (!obs_encoder_valid(encoder, "obs_encoder_set_group"))
 		return false;
 
-	if (obs_encoder_active(encoder) ||
-	    obs_encoder_active(encoder_to_be_grouped)) {
-		obs_encoder_t *active = obs_encoder_active(encoder)
-						? encoder
-						: encoder_to_be_grouped;
-		obs_encoder_t *other = active == encoder ? encoder_to_be_grouped
-							 : encoder;
+	if (obs_encoder_active(encoder)) {
 		blog(LOG_ERROR,
-		     "obs_encoder_group_keyframe_aligned_encoders: encoder '%s' "
-		     "is already active, could not group with '%s'",
-		     obs_encoder_get_name(active), obs_encoder_get_name(other));
-		return false;
-	}
-
-	if (encoder_to_be_grouped->encoder_group) {
-		blog(LOG_ERROR,
-		     "obs_encoder_group_keyframe_aligned_encoders: encoder '%s' "
-		     "is already part of a keyframe aligned group while trying "
-		     "to group with encoder '%s'",
-		     obs_encoder_get_name(encoder_to_be_grouped),
+		     "obs_encoder_set_group: encoder '%s' is already active",
 		     obs_encoder_get_name(encoder));
 		return false;
 	}
 
-	bool unlock = false;
-	if (!encoder->encoder_group) {
-		encoder->encoder_group = bzalloc(sizeof(struct encoder_group));
-		if (pthread_mutex_init(&encoder->encoder_group->mutex, NULL) <
-		    0) {
-			bfree(encoder->encoder_group);
-			encoder->encoder_group = NULL;
-			return false;
-		}
-
-		encoder->encoder_group->encoders_added = 1;
-	} else {
-		pthread_mutex_lock(&encoder->encoder_group->mutex);
-		unlock = true;
-		if (encoder->encoder_group->encoders_started != 0) {
+	if (encoder->encoder_group) {
+		struct obs_encoder_group *old_group = encoder->encoder_group;
+		pthread_mutex_lock(&old_group->mutex);
+		if (old_group->num_encoders_started) {
+			pthread_mutex_unlock(&old_group->mutex);
 			blog(LOG_ERROR,
-			     "obs_encoder_group_keyframe_aligned_encoders: "
-			     "Can't add encoder '%s' to active group "
-			     "from encoder '%s'",
-			     obs_encoder_get_name(encoder_to_be_grouped),
+			     "obs_encoder_set_group: encoder '%s' existing group has started encoders",
 			     obs_encoder_get_name(encoder));
-			pthread_mutex_unlock(&encoder->encoder_group->mutex);
 			return false;
 		}
+		da_erase_item(old_group->encoders, &encoder);
+		obs_encoder_release(encoder);
+		pthread_mutex_unlock(&old_group->mutex);
 	}
 
-	encoder->encoder_group->encoders_added += 1;
-	encoder_to_be_grouped->encoder_group = encoder->encoder_group;
+	if (!group)
+		return true;
 
-	if (unlock)
-		pthread_mutex_unlock(&encoder->encoder_group->mutex);
+	pthread_mutex_lock(&group->mutex);
+
+	if (group->num_encoders_started) {
+		pthread_mutex_unlock(&group->mutex);
+		blog(LOG_ERROR,
+		     "obs_encoder_set_group: specified group has started encoders");
+		return false;
+	}
+
+	obs_encoder_t *ref = obs_encoder_get_ref(encoder);
+	if (!ref) {
+		pthread_mutex_unlock(&group->mutex);
+		return false;
+	}
+	da_push_back(group->encoders, &ref);
+	encoder->encoder_group = group;
+
+	pthread_mutex_unlock(&group->mutex);
 
 	return true;
 }
 
-bool obs_encoder_group_remove_keyframe_aligned_encoder(
-	obs_encoder_t *encoder, obs_encoder_t *encoder_to_be_ungrouped)
+obs_encoder_group_t *obs_encoder_group_create()
 {
-	if (!obs_encoder_valid(
-		    encoder,
-		    "obs_encoder_group_remove_keyframe_aligned_encoder") ||
-	    !obs_encoder_valid(
-		    encoder_to_be_ungrouped,
-		    "obs_encoder_group_remove_keyframe_aligned_encoder"))
-		return false;
+	struct obs_encoder_group *group =
+		bzalloc(sizeof(struct obs_encoder_group));
 
-	if (obs_encoder_active(encoder) ||
-	    obs_encoder_active(encoder_to_be_ungrouped)) {
-		blog(LOG_ERROR,
-		     "obs_encoder_group_remove_keyframe_aligned_encoder: encoders are active, "
-		     "could not ungroup encoder '%s' from '%s'",
-		     obs_encoder_get_name(encoder_to_be_ungrouped),
-		     obs_encoder_get_name(encoder));
-		return false;
+	pthread_mutex_init_value(&group->mutex);
+	if (pthread_mutex_init(&group->mutex, NULL) != 0) {
+		bfree(group);
+		return NULL;
 	}
 
-	if (encoder->encoder_group != encoder_to_be_ungrouped->encoder_group) {
-		blog(LOG_ERROR,
-		     "obs_encoder_group_remove_keyframe_aligned_encoder: "
-		     "encoder '%s' does not belong to the same group as encoder '%s'",
-		     obs_encoder_get_name(encoder_to_be_ungrouped),
-		     obs_encoder_get_name(encoder));
-		return false;
-	}
+	return group;
+}
 
-	struct encoder_group *current_group = encoder->encoder_group;
-	struct encoder_group *free_group = NULL;
-
-	pthread_mutex_lock(&current_group->mutex);
-
-	if (current_group->encoders_started != 0) {
-		blog(LOG_ERROR,
-		     "obs_encoder_group_remove_keyframe_aligned_encoder: "
-		     "could not ungroup encoder '%s' from '%s' while "
-		     "the group contains active encoders",
-		     obs_encoder_get_name(encoder_to_be_ungrouped),
-		     obs_encoder_get_name(encoder));
-		pthread_mutex_unlock(&current_group->mutex);
-		return false;
-	}
-
-	current_group->encoders_added -= 1;
-	encoder_to_be_ungrouped->encoder_group = NULL;
-	if (current_group->encoders_added == 1) {
-		free_group = current_group;
+void obs_encoder_group_actually_destroy(obs_encoder_group_t *group)
+{
+	for (size_t i = 0; i < group->encoders.num; i++) {
+		struct obs_encoder *encoder = group->encoders.array[i];
 		encoder->encoder_group = NULL;
-	}
-	pthread_mutex_unlock(&current_group->mutex);
-
-	if (free_group) {
-		pthread_mutex_destroy(&free_group->mutex);
-		bfree(free_group);
+		obs_encoder_release(encoder);
 	}
 
-	return true;
+	da_free(group->encoders);
+	pthread_mutex_unlock(&group->mutex);
+	pthread_mutex_destroy(&group->mutex);
+
+	bfree(group);
+}
+
+void obs_encoder_group_destroy(obs_encoder_group_t *group)
+{
+	if (!group)
+		return;
+
+	pthread_mutex_lock(&group->mutex);
+
+	if (group->num_encoders_started) {
+		group->destroy_on_stop = true;
+		pthread_mutex_unlock(&group->mutex);
+		return;
+	}
+
+	obs_encoder_group_actually_destroy(group);
 }

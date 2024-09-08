@@ -23,8 +23,10 @@
 #endif
 
 enum AVHWDeviceType hw_priority[] = {
-	AV_HWDEVICE_TYPE_CUDA, AV_HWDEVICE_TYPE_D3D11VA, AV_HWDEVICE_TYPE_DXVA2,
-	AV_HWDEVICE_TYPE_QSV,  AV_HWDEVICE_TYPE_NONE,
+	AV_HWDEVICE_TYPE_D3D11VA,
+	AV_HWDEVICE_TYPE_DXVA2,
+	AV_HWDEVICE_TYPE_QSV,
+	AV_HWDEVICE_TYPE_NONE,
 };
 
 static bool has_hw_type(const AVCodec *c, enum AVHWDeviceType type)
@@ -89,11 +91,6 @@ int ffmpeg_decode_init(struct ffmpeg_decode *decode, enum AVCodecID id,
 		ffmpeg_decode_free(decode);
 		return ret;
 	}
-
-#if LIBAVCODEC_VERSION_MAJOR < 60
-	if (decode->codec->capabilities & CODEC_CAP_TRUNC)
-		decode->decoder->flags |= CODEC_FLAG_TRUNC;
-#endif
 
 	return 0;
 }
@@ -263,13 +260,8 @@ bool ffmpeg_decode_audio(struct ffmpeg_decode *decode, uint8_t *data,
 
 	audio->samples_per_sec = decode->frame->sample_rate;
 	audio->format = convert_sample_format(decode->frame->format);
-#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(59, 24, 100)
-	audio->speakers =
-		convert_speaker_layout((uint8_t)decode->decoder->channels);
-#else
 	audio->speakers = convert_speaker_layout(
 		(uint8_t)decode->decoder->ch_layout.nb_channels);
-#endif
 
 	audio->frames = decode->frame->nb_samples;
 
