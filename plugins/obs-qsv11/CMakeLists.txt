@@ -1,6 +1,4 @@
-cmake_minimum_required(VERSION 3.22...3.25)
-
-legacy_check()
+cmake_minimum_required(VERSION 3.28...3.30)
 
 option(ENABLE_QSV11 "Build Intel QSV11 Hardware Encoder." TRUE)
 if(NOT ENABLE_QSV11)
@@ -12,7 +10,7 @@ endif()
 add_library(obs-qsv11 MODULE)
 add_library(OBS::qsv11 ALIAS obs-qsv11)
 
-find_package(VPL 2.6 REQUIRED)
+find_package(VPL 2.9 REQUIRED)
 
 if(OS_LINUX)
   find_package(Libva REQUIRED)

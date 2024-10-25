@@ -1,10 +1,8 @@
-cmake_minimum_required(VERSION 3.22...3.25)
-
-legacy_check()
+cmake_minimum_required(VERSION 3.28...3.30)
 
 include(cmake/obs-version.cmake)
 
-if(OS_WINDOWS AND NOT OBS_PARENT_ARCHITECTURE STREQUAL CMAKE_GENERATOR_PLATFORM)
+if(OS_WINDOWS AND NOT OBS_PARENT_ARCHITECTURE STREQUAL CMAKE_VS_PLATFORM_NAME)
   include(cmake/os-windows.cmake)
   return()
 endif()
@@ -373,6 +371,7 @@ set(
   util/simde/x86/mmx.h
   util/simde/x86/sse.h
   util/simde/x86/sse2.h
+  util/source-profiler.h
   util/sse-intrin.h
   util/task.h
   util/text-lookup.h
